@@ -88,12 +88,12 @@ so the spray is something you can learn to hold down.
 Right click toggles ADS. Every weapon takes exactly 0.2s to settle in or out, tightens its
 spread, and costs 40% of your movement speed while held.
 
-| Weapon | FOV | Sight |
-| --- | --- | --- |
-| M4 Carbine | 75 to 55 | Red dot through an open tube |
-| KS-12 Pump | 75 to 60 | Bead raised clear of the heat shield |
-| P-9 Sidearm | 75 to 50 | Three-dot irons with an open notch |
-| SR-7 Longbow | 75 to 15 | Scope overlay, mil-dot reticle |
+| Weapon | FOV | Zoom | Sight |
+| --- | --- | --- | --- |
+| M4 Carbine | 75 to 38 | 2.2x | Red dot on tinted glass |
+| KS-12 Pump | 75 to 60 | 1.3x | Bead raised clear of the heat shield |
+| P-9 Sidearm | 75 to 50 | 1.7x | Three-dot irons with an open notch |
+| SR-7 Longbow | 75 to 15 | 5.8x | Scope overlay, mil-dot reticle |
 
 The sniper is the one that changes the screen. Scoping swaps the crosshair for a full
 overlay and hides the weapon behind the glass, which the composite shader veils the way
@@ -128,8 +128,8 @@ There are no image, audio or model files anywhere in this repository.
 
 Concrete, corrugated steel, plywood, rust, brick and chain link are painted into canvases at
 load, down to the stencilled shipping marks on the container flanks. Weapons, hands and
-soldiers are assembled from boxes, cylinders and spheres. The sky is a procedural dome with
-an industrial skyline on the horizon.
+soldiers are assembled from boxes, cylinders and spheres. The sky is evaluated per fragment
+and the industrial skyline on the horizon is geometry.
 
 Every sound is synthesised through the Web Audio API: per-weapon gunshots layered from a
 crack, a body and a chest thump, reloads, footsteps, impact sounds that differ between wall
@@ -148,7 +148,7 @@ pass for objects that only ever contributed a sub-pixel smudge.
 
 ## Implementation notes
 
-Five things are worth knowing before modifying `index.html`.
+Six things are worth knowing before modifying `index.html`.
 
 **No environment map.** three.js renders a metal with nothing to reflect as near-black, so
 every material stays close to dielectric (`metalness` under about 0.2) and fakes metal
@@ -165,6 +165,22 @@ chromatic aberration, vignette, colour grading, damage tint and the low-health p
 live in one composite pass over a pair of render targets. Shadow tinting there is
 multiplicative on purpose; an additive lift in linear space swamps near-black pixels and
 turns the whole frame blue.
+
+**The sky is a shader, and it has to be.** It began as a 4096x2048 equirectangular canvas,
+which sounds like plenty until you do the arithmetic: 4096 texels over 360 degrees is 11
+texels per degree, and the sniper's 15 degree field of view puts about 170 of them across a
+1920 pixel screen. Eleven screen pixels per texel. Doubling the sheet buys one stop and costs
+64MB, and it does nothing about the other half of the problem, which is that an equirect
+projection collapses every column onto the zenith and smears whatever is painted up there
+into a pinwheel. The replacement evaluates a gradient, a cloud deck and a cirrus layer per
+fragment, so the scope magnifies ray directions instead of a bitmap. Clouds are projected
+onto a flat slab overhead (`dir.xz / dir.y`), which bunches them towards the horizon the way
+perspective actually does and makes the zenith an ordinary point of the plane rather than a
+singularity. The fbm is band-limited against `fwidth` of that projection: octaves finer than
+the fragment footprint are dropped rather than sampled, which is what stops the deck from
+aliasing into a shimmer near the horizon where the slab stretches a degree of sky across
+hundreds of noise cells. It measures free against a flat colour, because the dome is drawn
+last of the opaque queue and early-z kills every sky fragment behind a wall.
 
 **Sight alignment is data, not guesswork.** Each viewmodel returns an `adsPos` that puts its
 sight on the viewmodel camera's -Z axis: `x` is zero and `y` is the negative of the sight's

@@ -1255,159 +1255,259 @@ skyFill.position.set(0.75,0.55,-0.62);
 scene.add(skyFill);
 
 /* -------------------------------------------------------------------------
-   Sky: painted once into an equirectangular canvas rather than evaluated per
-   pixel. SphereGeometry UVs are already equirect — u runs -X → +Z → +X, and
-   v=1 (canvas row 0) is the zenith — so the dome just samples it.
+   SKY
+
+   This was a 4096x2048 equirectangular canvas until it wasn't good enough.
+   The arithmetic is what killed it: 4096 texels spread over 360 degrees is
+   11 texels per degree, and the sniper's 15 degree field of view puts about
+   170 of them across a 1920 pixel screen. Eleven screen pixels per texel.
+   No canvas size fixes that -- doubling it again buys one stop and costs
+   64 MB -- and on top of the blur an equirect sheet collapses every column
+   onto the zenith, so whatever is painted up there smears into a pinwheel.
+
+   So the sky is evaluated per fragment instead. It is resolution independent
+   by construction: the scope magnifies the ray directions, not a bitmap.
    ------------------------------------------------------------------------- */
 const SKY_HAZE = '#b0a99c';
-function makeSkyTex(){
-  const W=2048, H=1024, HZ=H*0.5;
-  const c = document.createElement('canvas'); c.width=W; c.height=H;
-  const x = c.getContext('2d');
 
-  /* vertical gradient, zenith to haze */
-  const g = x.createLinearGradient(0,0,0,HZ);
-  g.addColorStop(0.00,'#2f4055');
-  g.addColorStop(0.34,'#5c6d7c');
-  g.addColorStop(0.66,'#8b9196');
-  g.addColorStop(0.90,'#a8a79f');
-  g.addColorStop(1.00, SKY_HAZE);
-  x.fillStyle=g; x.fillRect(0,0,W,HZ);
-  x.fillStyle=SKY_HAZE; x.fillRect(0,HZ,W,H-HZ);
+/* Authored in sRGB because every other colour in this project is, and the
+   grade downstream was tuned against those numbers. The shader converts once
+   at the end. */
+const SKY_C = (hex)=>{ const c=new THREE.Color(hex); return new THREE.Vector3(c.r,c.g,c.b); };
 
-  /* sun position in uv */
-  const sunU = (Math.atan2(SUN_DIR.z, -SUN_DIR.x) + Math.PI*2) % (Math.PI*2) / (Math.PI*2);
-  const sunV = Math.acos(clamp(SUN_DIR.y,-1,1)) / Math.PI;     // 0 top .. 1 bottom
-  const sx = sunU*W, sy = sunV*H;
+const skyUniforms = {
+  uTime:   { value: 0 },
+  uSun:    { value: SUN_DIR.clone() },
+  uSunXZ:  { value: new THREE.Vector2(SUN_DIR.x, SUN_DIR.z).normalize() },
+  uZen:    { value: SKY_C('#2f4055') },
+  uHigh:   { value: SKY_C('#5c6d7c') },
+  uMid:    { value: SKY_C('#8b9196') },
+  uLow:    { value: SKY_C('#a8a79f') },
+  uHaze:   { value: SKY_C(SKY_HAZE) },
+  uGround: { value: SKY_C('#8a8378') },
+  /* the deck is dirty weather over a working yard, not a fair weather cumulus
+     field: the two tones stay close together so the sky reads as one heavy
+     ceiling rather than a set of separate bright clouds */
+  uCloudD: { value: SKY_C('#71757c') },
+  uCloudL: { value: SKY_C('#c6c1b6') }
+};
 
-  /* broad warm wash around the sun, drawn three times across the seam so the
-     glow wraps instead of getting clipped at u=0 */
-  for (const off of [-W,0,W]){
-    let gg = x.createRadialGradient(sx+off,sy,0, sx+off,sy, W*0.34);
-    gg.addColorStop(0,'rgba(255,214,160,0.55)');
-    gg.addColorStop(0.28,'rgba(238,196,152,0.26)');
-    gg.addColorStop(1,'rgba(226,196,160,0)');
-    x.fillStyle=gg; x.fillRect(0,0,W,H);
+const skyMat = new THREE.ShaderMaterial({
+  uniforms: skyUniforms,
+  side: THREE.BackSide,
+  depthWrite: false,
+  fog: false,
+  extensions: { derivatives: true },
+  vertexShader: `
+  varying vec3 vDir;
+  void main(){
+    /* the dome is pinned to the camera, so object space is view direction */
+    vDir = position;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+  }`,
+  fragmentShader: `
+  precision highp float;
+  varying vec3 vDir;
+  uniform float uTime;
+  uniform vec3  uSun, uZen, uHigh, uMid, uLow, uHaze, uGround, uCloudD, uCloudL;
+  uniform vec2  uSunXZ;
+
+  float hash21(vec2 p){
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+  }
+  float vnoise(vec2 p){
+    vec2 i = floor(p), f = fract(p);
+    f = f*f*(3.0-2.0*f);
+    return mix(mix(hash21(i),             hash21(i+vec2(1.0,0.0)), f.x),
+               mix(hash21(i+vec2(0.0,1.0)),hash21(i+vec2(1.0,1.0)), f.x), f.y);
+  }
+  /* Band limited: fw is the width of this fragment's footprint in noise units,
+     and any octave finer than the footprint is dropped rather than sampled.
+     Without this the deck aliases into a shimmering mess towards the horizon,
+     where the slab projection stretches a whole degree of sky across hundreds
+     of noise cells. Renormalising by the surviving weight keeps the mean at
+     0.5 so coverage does not drift as octaves fall away. */
+  float fbm5(vec2 p, float fw){
+    /* persistence under a half. Textbook 0.5 leaves so much energy in the fine
+       octaves that the deck breaks up into speckle; weighting the base octave
+       harder gives big soft masses with detail on them. */
+    float s=0.0, n=0.0, a=0.5, f=1.0;
+    for (int i=0;i<5;i++){
+      float w = a * (1.0 - smoothstep(0.30, 0.90, fw*f));
+      s += w*vnoise(p*f); n += w; f *= 2.03; a *= 0.44;
+    }
+    return n > 1e-4 ? s/n : 0.5;
+  }
+  float fbm3(vec2 p, float fw){
+    float s=0.0, n=0.0, a=0.5, f=1.0;
+    for (int i=0;i<3;i++){
+      float w = a * (1.0 - smoothstep(0.30, 0.90, fw*f));
+      s += w*vnoise(p*f); n += w; f *= 2.03; a *= 0.5;
+    }
+    return n > 1e-4 ? s/n : 0.5;
+  }
+  float fbm2(vec2 p, float fw){
+    float s=0.0, n=0.0, a=0.5, f=1.0;
+    for (int i=0;i<2;i++){
+      float w = a * (1.0 - smoothstep(0.30, 0.90, fw*f));
+      s += w*vnoise(p*f); n += w; f *= 2.03; a *= 0.5;
+    }
+    return n > 1e-4 ? s/n : 0.5;
   }
 
-  /* cloud deck: soft blobs squashed harder as they approach the horizon */
-  const cloud = (cx,cy,r,squash,tone,a)=>{
-    const gg = x.createRadialGradient(cx,cy,0,cx,cy,r);
-    gg.addColorStop(0,`rgba(${tone},${a})`);
-    gg.addColorStop(0.55,`rgba(${tone},${a*0.55})`);
-    gg.addColorStop(1,`rgba(${tone},0)`);
-    x.save(); x.translate(cx,cy); x.scale(1,squash); x.translate(-cx,-cy);
-    x.fillStyle=gg; x.beginPath(); x.arc(cx,cy,r,0,7); x.fill(); x.restore();
+  void main(){
+    vec3 d = normalize(vDir);
+    float sd = max(dot(d, uSun), 0.0);
+
+    /* elevation as a fraction of the quarter turn, which is how the original
+       gradient was laid out -- linear in angle, not in sin(angle) */
+    float t = clamp(asin(clamp(d.y,-1.0,1.0)) * 0.63661977, 0.0, 1.0);
+    vec3 col = mix(uHaze, uLow,  smoothstep(0.00, 0.11, t));
+    col = mix(col, uMid,  smoothstep(0.11, 0.36, t));
+    col = mix(col, uHigh, smoothstep(0.36, 0.68, t));
+    col = mix(col, uZen,  smoothstep(0.68, 1.00, t));
+    col += vec3(0.30,0.21,0.11) * pow(sd, 2.2) * 0.62;
+
+    if (d.y > -0.02){
+      /* Project onto a flat slab overhead. Clouds bunch towards the horizon on
+         their own and the zenith is an ordinary point of the plane, so there is
+         no pole to smear -- the failure mode of the equirect sheet is designed
+         out rather than papered over. */
+      vec2  cp = d.xz / max(d.y, 0.055);
+      float fw = max(length(dFdx(cp)), length(dFdy(cp)));
+      vec2  wind = vec2(uTime*0.0040, uTime*0.0016);
+      const float K = 2.35;
+
+      float n  = fbm5(cp*K + wind, fw*K);
+      /* wide threshold on purpose. A tight one turns every octave into a hard
+         edged blob and the sky reads as a mackerel pattern; letting the ramp
+         span most of the field's range keeps the deck continuous and puts the
+         detail in its shading instead of its outline. */
+      float cov = smoothstep(0.30, 0.80, n);
+
+      /* one sample displaced towards the sun stands in for a light march:
+         where the deck is thickening in that direction the fragment is in
+         its own shadow, where it is thinning it catches the crown */
+      float n2 = fbm2((cp + uSunXZ*0.30)*K + wind, fw*K);
+      vec3 cc = mix(uCloudD, uCloudL, clamp((n-n2)*2.6 + 0.50, 0.0, 1.0));
+
+      /* cirrus: the same field squashed hard on one axis, which is all a
+         wind sheared streak is. Kept faint -- it is texture on the ceiling,
+         not a second layer competing with it. */
+      vec2 sp = vec2(cp.x*0.22, cp.y*1.35)*(K*1.9) + wind*2.4;
+      float cir = smoothstep(0.52, 0.86, fbm3(sp, fw*K*2.6)) * 0.10;
+
+      float fade = smoothstep(0.008, 0.075, d.y);
+      col = mix(col, vec3(0.80,0.81,0.82), cir*fade);
+      col = mix(col, cc, cov*fade*0.94);
+      col += vec3(0.40,0.30,0.17) * pow(sd, 55.0) * (1.0 - cov*0.55);
+    }
+
+    /* The haze band has to reach a good twenty degrees up. It is the only
+       thing that puts air between the yard and the backdrop, and without it
+       the cloud deck runs straight down behind the containers and the whole
+       scene flattens onto one plane. */
+    float hz = 1.0 - smoothstep(0.0, 0.42, d.y);
+    col = mix(col, uHaze, pow(hz, 1.5)*0.85);
+    col = mix(col, uGround, smoothstep(0.0, -0.055, d.y));
+
+    /* a shade under one 8 bit level, which is enough to scatter the contour
+       lines the tone map would otherwise pull out of a gradient this broad */
+    col += (hash21(gl_FragCoord.xy) - 0.5) * 0.0045;
+    gl_FragColor = vec4(pow(max(col,0.0), vec3(2.2)), 1.0);
+  }`
+});
+
+/* 64x32 is plenty now that nothing is sampled from a sheet -- the segments
+   only have to keep the sphere from looking faceted against its own gradient. */
+const skyDome = new THREE.Mesh(new THREE.SphereGeometry(300, 64, 32), skyMat);
+skyDome.frustumCulled = false;
+/* Drawn last of the opaque queue rather than first: the dome writes no depth,
+   so every sky fragment hidden behind a wall is killed by early-z instead of
+   running the noise. In a yard this enclosed that is most of the screen. */
+skyDome.renderOrder = 1000;
+/* Pinned to the eye so the sky is at infinity. Left at the origin the 300m
+   dome shows real parallax across a 90m map and the sun drifts as you walk. */
+skyDome.matrixAutoUpdate = false;
+skyDome.updateMatrixWorld = function(){
+  this.matrixWorld.setPosition(camera.position);
+};
+scene.add(skyDome);
+
+/* ---- distant skyline ------------------------------------------------------
+   Silhouettes, not paint. On the old sheet these were thirty texels tall and
+   were the first thing to dissolve when the scope came up. As geometry they
+   hold an edge at any magnification for about six hundred triangles, and the
+   haze is baked into the vertex colours so they sit in the air rather than in
+   front of it -- scene fog at 270m would erase them entirely.
+   ------------------------------------------------------------------------- */
+{
+  const pos=[], col=[], idx=[];
+  const DARK = new THREE.Color('#56565b');
+  const HAZE = new THREE.Color(SKY_HAZE);
+  const D2R = Math.PI/180;
+
+  /* az/width in degrees of azimuth, y0/y1 in degrees of elevation: the
+     silhouette is authored in the angles it subtends, then projected out to
+     whatever radius the rank sits at */
+  const push = (R, az, wDeg, y0Deg, y1Deg, blend)=>{
+    const hw = R*Math.tan(wDeg*0.5*D2R);
+    const s = Math.sin(az*D2R), c = Math.cos(az*D2R);
+    const cx = R*s, cz = R*c, tx = c, tz = -s;
+    const y0 = y0Deg*D2R*R, y1 = y1Deg*D2R*R;
+    const k = DARK.clone().lerp(HAZE, blend).convertSRGBToLinear();
+    const b = pos.length/3;
+    pos.push(cx-tx*hw, y0, cz-tz*hw,  cx+tx*hw, y0, cz+tz*hw,
+             cx+tx*hw, y1, cz+tz*hw,  cx-tx*hw, y1, cz-tz*hw);
+    for (let i=0;i<4;i++) col.push(k.r, k.g, k.b);
+    idx.push(b,b+1,b+2, b,b+2,b+3);
   };
-  for (let i=0;i<190;i++){
-    const t  = Math.pow(Math.random(), 1.5);           // bunch toward horizon
-    const cy = 24 + t*(HZ-40);
-    const persp = 1 - t*0.72;
-    const cx = Math.random()*W;
-    const r  = rand(60,190)*persp + 18;
-    const squash = 0.20 + persp*0.30;
-    /* lit crown offset toward the sun, shadowed belly under it */
-    const dir = ((sx - cx + W*1.5) % W) - W*0.5 > 0 ? 1 : -1;
-    cloud(cx, cy+r*squash*0.35, r*1.05, squash, '92,96,104', 0.30);
-    cloud(cx + dir*r*0.16, cy - r*squash*0.20, r*0.86, squash, '214,208,196', 0.34);
-  }
-  /* thin high streaks */
-  x.globalAlpha = 0.16;
-  for (let i=0;i<40;i++){
-    const cy = rand(10, HZ*0.5), cx = Math.random()*W, w = rand(150,520);
-    const gg = x.createLinearGradient(cx-w/2,0,cx+w/2,0);
-    gg.addColorStop(0,'rgba(210,214,220,0)');
-    gg.addColorStop(0.5,'rgba(210,214,220,1)');
-    gg.addColorStop(1,'rgba(210,214,220,0)');
-    x.fillStyle=gg; x.fillRect(cx-w/2, cy, w, rand(3,9));
-  }
-  x.globalAlpha = 1;
 
-  /* haze band that softens the horizon. It used to run to full opacity, which
-     erased the skyline drawn below and left a blank white strip where the
-     district should be — it now tops out part way so silhouettes survive it. */
-  const hb = x.createLinearGradient(0,HZ-H*0.13,0,HZ+2);
-  hb.addColorStop(0,'rgba(176,169,156,0)');
-  hb.addColorStop(0.55,'rgba(178,171,158,0.30)');
-  hb.addColorStop(1,'rgba(180,173,160,0.62)');
-  x.fillStyle=hb; x.fillRect(0,HZ-H*0.13,W,H*0.13+2);
-
-  /* ---- distant skyline. 1024px of canvas spans 180 degrees, so anything
-         taller than ~30px reads as a nearby tower rather than the far side of
-         the district. Everything here stays under 6 degrees of elevation. ---- */
-  const drawSkyline = (baseY, scale, alpha)=>{
-    x.fillStyle = `rgba(86,86,88,${alpha})`;
-    let px = -100;
-    while (px < W+100){
-      const kind = Math.random();
-      if (kind < 0.16){                                  // stack
-        const w = rand(2.5,5)*scale, h = rand(20,34)*scale;
-        x.fillRect(px, baseY-h, w, h);
-        px += w + rand(6,26)*scale;
-      } else if (kind < 0.32){                           // gantry crane
-        const w = rand(26,46)*scale, h = rand(12,19)*scale;
-        x.fillRect(px, baseY-h, 2.2*scale, h);
-        x.fillRect(px+w-2.2*scale, baseY-h, 2.2*scale, h);
-        x.fillRect(px-6*scale, baseY-h-2.6*scale, w+16*scale, 2.6*scale);
-        px += w + rand(12,44)*scale;
-      } else if (kind < 0.46){                           // storage tank
-        const r = rand(6,12)*scale;
-        x.beginPath(); x.arc(px+r, baseY-r*0.7, r, Math.PI, 0); x.fill();
-        x.fillRect(px, baseY-r*0.7, r*2, r*0.7);
-        px += r*2 + rand(8,30)*scale;
-      } else if (kind < 0.62){                           // pylon
-        const h = rand(15,26)*scale, w = rand(6,9)*scale;
-        x.fillRect(px+w*0.42, baseY-h, 1.4*scale, h);
-        for (let k=0;k<3;k++) x.fillRect(px, baseY-h+k*(h*0.3), w, 1.2*scale);
-        px += w + rand(30,90)*scale;
-      } else {                                           // warehouse block
-        const w = rand(30,120)*scale, h = rand(5,13)*scale;
-        x.fillRect(px, baseY-h, w, h);
-        if (Math.random()<0.45) x.fillRect(px+w*0.2, baseY-h-3*scale, w*0.22, 3*scale);
-        px += w + rand(8,40)*scale;
+  const rank = (R, scale, blend)=>{
+    let az = rand(0,40);
+    while (az < 360){
+      const k = Math.random();
+      if (k < 0.16){                                   // chimney stack
+        const w = rand(0.30,0.62)*scale, h = rand(1.9,3.2)*scale;
+        push(R, az+w*0.5, w, -0.4, h, blend);
+        az += w + rand(0.9,3.6)*scale;
+      } else if (k < 0.32){                            // gantry crane
+        const w = rand(3.2,5.6)*scale, h = rand(1.2,1.9)*scale, leg = 0.26*scale;
+        push(R, az+leg*0.5, leg, -0.4, h, blend);
+        push(R, az+w-leg*0.5, leg, -0.4, h, blend);
+        push(R, az+w*0.5, w+1.6*scale, h, h+0.30*scale, blend);
+        az += w + rand(1.6,5.4)*scale;
+      } else if (k < 0.46){                            // storage tank
+        const w = rand(1.4,2.7)*scale, h = w*0.62;
+        push(R, az+w*0.5, w, -0.4, h, blend);
+        push(R, az+w*0.5, w*0.78, h, h+w*0.22, blend); // domed top, squared off
+        az += w + rand(1.1,3.9)*scale;
+      } else if (k < 0.62){                            // lattice pylon
+        const w = rand(0.75,1.1)*scale, h = rand(1.5,2.5)*scale;
+        push(R, az+w*0.5, 0.17*scale, -0.4, h, blend);
+        for (let j=0;j<3;j++) push(R, az+w*0.5, w, h*(0.30+j*0.235), h*(0.30+j*0.235)+0.13*scale, blend);
+        az += w + rand(4.0,11.5)*scale;
+      } else {                                         // warehouse block
+        const w = rand(3.8,15.0)*scale, h = rand(0.5,1.3)*scale;
+        push(R, az+w*0.5, w, -0.4, h, blend);
+        if (Math.random()<0.45) push(R, az+w*0.3, w*0.22, h, h+0.30*scale, blend);
+        az += w + rand(1.1,5.0)*scale;
       }
     }
   };
-  drawSkyline(HZ+1, 1.0, 0.34);
-  drawSkyline(HZ+1, 0.62, 0.46);
+  rank(292, 1.00, 0.62);    // far rank sits deeper in the haze
+  rank(258, 0.74, 0.40);
 
-  /* two thin smoke columns leaning downwind */
-  for (let i=0;i<2;i++){
-    const bx = rand(0,W), by = HZ - rand(16,30);
-    for (let k=0;k<22;k++){
-      const t=k/22;
-      cloud(bx + t*rand(50,140), by - t*rand(30,80), 7+t*34, 0.9, '164,161,157', 0.045);
-    }
-  }
-
-  /* final haze wash: the skyline sits behind the air, not in front of it */
-  const hz2 = x.createLinearGradient(0,HZ-40,0,HZ+2);
-  hz2.addColorStop(0,'rgba(176,169,156,0.04)');
-  hz2.addColorStop(1,'rgba(178,171,158,0.34)');
-  x.fillStyle=hz2; x.fillRect(0,HZ-40,W,42);
-
-  /* below the eye line the air is thicker and dirtier than it is above it, so
-     the ground haze runs a shade darker — this is the line that tells you the
-     world keeps going rather than stopping at a painted edge */
-  const gh = x.createLinearGradient(0,HZ,0,HZ+H*0.10);
-  gh.addColorStop(0,'rgba(140,134,122,0.0)');
-  gh.addColorStop(0.35,'rgba(140,134,122,0.55)');
-  gh.addColorStop(1,'rgba(128,122,111,0.85)');
-  x.fillStyle=gh; x.fillRect(0,HZ,W,H*0.10);
-
-  const t = new THREE.CanvasTexture(c);
-  t.wrapS = THREE.RepeatWrapping;
-  t.wrapT = THREE.ClampToEdgeWrapping;
-  t.encoding = THREE.sRGBEncoding;
-  t.anisotropy = MAXANISO;
-  return t;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+  g.setAttribute('color',    new THREE.Float32BufferAttribute(col,3));
+  g.setIndex(idx);
+  const sl = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors:true, fog:false, side:THREE.DoubleSide }));
+  sl.frustumCulled = false;
+  scene.add(sl);
 }
-const skyDome = new THREE.Mesh(
-  new THREE.SphereGeometry(300, 48, 28),
-  new THREE.MeshBasicMaterial({ map:makeSkyTex(), side:THREE.BackSide, depthWrite:false, fog:false })
-);
-skyDome.renderOrder = -1;
-scene.add(skyDome);
 
 /* =========================================================================
    5. WORLD / MAP  —  abandoned warehouse district, 60x60
@@ -3553,10 +3653,14 @@ const SKIN     = new THREE.MeshStandardMaterial({color:0xb08560, metalness:.0, r
 const SLEEVE   = new THREE.MeshStandardMaterial({map:TEX_SLEEVE, color:0x5d6350, metalness:.02, roughness:.92});
 const SLEEVE_D = new THREE.MeshStandardMaterial({map:TEX_SLEEVE, color:0x474c3d, metalness:.02, roughness:.94});
 const ACCENT_R = new THREE.MeshStandardMaterial({color:0xff2a1a, emissive:0xff2a1a, emissiveIntensity:1.4, roughness:.5});
-/* dark enough that the reticle has something to sit against — a bright lens
-   swallows the dot and leaves the sight looking like a blue button */
-const OPTIC_GLASS = new THREE.MeshStandardMaterial({color:0x17252e, metalness:.42, roughness:.10,
-                                                    emissive:0x0b1a22, emissiveIntensity:.45});
+/* Actual glass. This used to be an opaque disc, which put a dark plate across
+   the sight line at exactly the moment you aimed at something — the target sat
+   behind its own optic. Tinted and mostly clear reads like a coated lens, keeps
+   enough cast for the dot to sit against, and lets you see what you are
+   shooting. depthWrite off so it blends with the world instead of masking it. */
+const OPTIC_GLASS = new THREE.MeshStandardMaterial({color:0x3d6274, metalness:.42, roughness:.10,
+                                                    emissive:0x0b1a22, emissiveIntensity:.30,
+                                                    transparent:true, opacity:0.20, depthWrite:false});
 /* optic bodies are open tubes, so their inner wall has to render too */
 const TUBE_MAT = new THREE.MeshStandardMaterial({color:0x33383e, metalness:.18, roughness:.55,
                                                  side:THREE.DoubleSide});
@@ -3648,11 +3752,14 @@ function buildRifle(){
   part(opt, B(0.017,0.012,0.026), POLYMER, 0,0.046,0.012);          // elevation turret
   /* emitter plus an additive bloom the post pass can catch — a plain sphere
      just reads as a red speck instead of a lit reticle floating on the glass */
-  const dot = part(opt, new THREE.SphereGeometry(0.0052,8,6), ACCENT_R, 0,0.018,-0.040);
+  /* Sized against clear glass. It was drawn to carry over an opaque dark lens;
+     now that you can see through the sight, anything that big is a red smear
+     sitting on whatever you are aiming at. */
+  const dot = part(opt, new THREE.SphereGeometry(0.0032,8,6), ACCENT_R, 0,0.018,-0.040);
   const dotGlow = new THREE.Sprite(new THREE.SpriteMaterial({
     map:TEX.glow, color:0xff3320, transparent:true, blending:THREE.AdditiveBlending,
-    depthWrite:false, opacity:0.85 }));
-  dotGlow.scale.set(0.030,0.030,1);
+    depthWrite:false, opacity:0.80 }));
+  dotGlow.scale.set(0.015,0.015,1);
   dotGlow.position.set(0,0.018,-0.0385);
   opt.add(dotGlow);
   /* charging handle + ejection port + brass deflector */
@@ -3889,7 +3996,10 @@ const WEAPONS = [
     recoilKick:0.035, recoilRot:0.055, camPitch:0.0125, camYaw:0.0048, fovKick:0.55,
     reloadTime:2.15, drawTime:0.55, shakeAmt:0.16, range:140,
     falloffStart:45, falloffRange:60, falloffMin:0.55,
-    adsFov:55, adsSpread:0.42, adsTime:0.20, noise:36,
+    /* 2.2x. At the old 55 this was 1.47x, which over the ranges this map
+       actually plays at barely changed the picture — a man at 25 m stayed
+       small enough to hide behind the optic housing. */
+    adsFov:38, adsSpread:0.42, adsTime:0.20, noise:36,
     shellBig:false, build:buildRifle },
   { id:'shotgun', name:'KS-12 PUMP', sound:'shotgun',
     magSize:8, reserve:48, maxReserve:48, damage:15, headMult:1.7,
@@ -4068,29 +4178,30 @@ function buildEnemyModel(){
   for (const s of [-1,1]){
     const hip = new THREE.Group(); hip.position.set(s*0.135, 0.90, 0); body.add(hip);
     part(hip, EB(0.185,0.46,0.20), E_MAT.cloth, 0,-0.23,0);
-    part(hip, B(0.155,0.115,0.055), E_MAT.vest, 0,-0.40,0.106);        // knee pad
+    part(hip, B(0.155,0.115,0.055), E_MAT.vest, 0,-0.40,-0.106);       // knee pad
     const knee = new THREE.Group(); knee.position.set(0,-0.46,0); hip.add(knee);
     part(knee, EB(0.165,0.44,0.185), E_MAT.cloth, 0,-0.22,0);
-    part(knee, B(0.172,0.17,0.195), E_MAT.boot, 0,-0.38,0.004);        // boot upper
-    part(knee, B(0.175,0.10,0.28), E_MAT.boot, 0,-0.42,0.035);
+    part(knee, B(0.172,0.17,0.195), E_MAT.boot, 0,-0.38,-0.004);       // boot upper
+    part(knee, B(0.175,0.10,0.28), E_MAT.boot, 0,-0.42,-0.035);        // toe
     legs.push({hip,knee});
   }
   /* torso: soft body under a hard plate carrier, so the armour reads as a
-     separate slab rather than a colour change */
+     separate slab rather than a colour change.
+     -Z is the front, matching the head, the rifle, and the yaw the AI steers to. */
   capsuleGroup(body, 0.215, 0.44, E_MAT.cloth, 0, 1.20, 0);
-  part(body, B(0.455,0.50,0.315), E_MAT.vest, 0, 1.25, 0.005);        // carrier
-  part(body, B(0.30,0.20,0.075), E_MAT.vest, 0, 1.30, 0.175);         // front plate
-  part(body, B(0.115,0.115,0.075), E_MAT.webb, 0.135, 1.13, 0.175);   // mag pouches
-  part(body, B(0.115,0.115,0.075), E_MAT.webb, 0.0,   1.13, 0.178);
-  part(body, B(0.115,0.115,0.075), E_MAT.webb,-0.135, 1.13, 0.175);
-  part(body, B(0.20,0.075,0.06),   E_MAT.webb, 0,     1.44, 0.168);   // radio on chest
-  part(body, B(0.075,0.020,0.020), E_MAT.accent, 0, 1.40, 0.196);     // IFF strobe
-  part(body, B(0.485,0.115,0.30),  E_MAT.vest, 0, 1.48, 0.005);       // shoulder yoke
-  part(body, B(0.40,0.10,0.32),    E_MAT.webb, 0, 1.06, 0.005);       // belt kit
-  part(body, B(0.11,0.15,0.09),    E_MAT.webb, 0.20, 1.02, 0.06);     // hip pouches
-  part(body, B(0.11,0.15,0.09),    E_MAT.webb,-0.20, 1.02, 0.06);
-  part(body, B(0.30,0.30,0.16),    E_MAT.webb, 0, 1.34, -0.21);       // daypack
-  part(body, B(0.11,0.24,0.10),    E_MAT.vest, 0.13, 1.36,-0.30);     // roll on pack
+  part(body, B(0.455,0.50,0.315), E_MAT.vest, 0, 1.25, -0.005);       // carrier
+  part(body, B(0.30,0.20,0.075), E_MAT.vest, 0, 1.30, -0.175);        // front plate
+  part(body, B(0.115,0.115,0.075), E_MAT.webb, 0.135, 1.13, -0.175);  // mag pouches
+  part(body, B(0.115,0.115,0.075), E_MAT.webb, 0.0,   1.13, -0.178);
+  part(body, B(0.115,0.115,0.075), E_MAT.webb,-0.135, 1.13, -0.175);
+  part(body, B(0.20,0.075,0.06),   E_MAT.webb, 0,     1.44, -0.168);  // radio on chest
+  part(body, B(0.075,0.020,0.020), E_MAT.accent, 0, 1.40, -0.196);    // IFF strobe
+  part(body, B(0.485,0.115,0.30),  E_MAT.vest, 0, 1.48, -0.005);      // shoulder yoke
+  part(body, B(0.40,0.10,0.32),    E_MAT.webb, 0, 1.06, -0.005);      // belt kit
+  part(body, B(0.11,0.15,0.09),    E_MAT.webb, 0.20, 1.02, -0.06);    // hip pouches
+  part(body, B(0.11,0.15,0.09),    E_MAT.webb,-0.20, 1.02, -0.06);
+  part(body, B(0.30,0.30,0.16),    E_MAT.webb, 0, 1.34, 0.21);        // daypack
+  part(body, B(0.11,0.24,0.10),    E_MAT.vest, 0.13, 1.36, 0.30);     // roll on pack
   /* neck + head */
   part(body, CYL(0.062,0.062,0.10,8), E_MAT.skin, 0, 1.53, 0);
   const head = new THREE.Group(); head.position.set(0,1.655,0); body.add(head);
@@ -5463,8 +5574,18 @@ function updateEnemy(e, dt){
         else { e.avoidX=-desiredX; e.avoidZ=-desiredZ; e.avoidT=0.3; e.avoidSide=-e.avoidSide; }
       }
     }
-    if (e.avoidT>0){ e.avoidT-=dt; desiredX=e.avoidX; desiredZ=e.avoidZ;
-                     e.targetYaw = Math.atan2(desiredX,desiredZ)+PI; }
+    if (e.avoidT>0){
+      e.avoidT-=dt; desiredX=e.avoidX; desiredZ=e.avoidZ;
+      /* Steering, not facing. The whisker is allowed to pick a heading up to
+         2.45 rad off the one it wanted, and slamming the body onto it turned a
+         man rounding a crate in the middle of a firefight to point his rifle at
+         the crate — the "enemies shooting backwards" bug, measured at 135 deg
+         off target. In contact he stays square to whoever he is shooting at and
+         walks the detour sideways; out of contact, facing the way you are going
+         is the natural thing and the whisker keeps it. */
+      if (!(e.state===ST.COMBAT && e.lastSeen < 1.2))
+        e.targetYaw = Math.atan2(desiredX,desiredZ)+PI;
+    }
   } else { e.avoidT=0; e.avoidSide=0; e.clearT=0; }
 
   /* ---------- move ---------- */
@@ -5542,21 +5663,25 @@ function updateEnemy(e, dt){
   const combat = (e.state===ST.COMBAT || e.state===ST.ALERT) ? 1 : 0;
   e.combatBlend = damp(e.combatBlend===undefined?0:e.combatBlend, combat, 7, dt);
   const cb = e.combatBlend;
-  /* arms: patrol carry vs. shouldered aim */
-  p.arms[0].sh.rotation.x = lerp(-0.55 - s1*0.25*walk, -1.42, cb);
-  p.arms[0].sh.rotation.z = lerp(0.30, 0.16, cb);
-  p.arms[0].el.rotation.x = lerp(-0.85, -0.55, cb);
-  p.arms[1].sh.rotation.x = lerp(-0.70 + s1*0.25*walk, -1.30, cb);
-  p.arms[1].sh.rotation.z = lerp(-0.34, -0.44, cb);
-  p.arms[1].el.rotation.x = lerp(-1.00, -0.75, cb);
-  p.gun.position.set(lerp(0.16,0.05,cb), lerp(-0.30,-0.16,cb), lerp(-0.22,-0.28,cb));
-  p.gun.rotation.set(lerp(0.35,0,cb), lerp(-0.25,0,cb), lerp(0.25,0,cb));
-  p.rig.rotation.x = lerp(0, -e.aimPitch, cb);
-  p.head.rotation.x = lerp(0, -e.aimPitch*0.5, cb);
+  /* Arms: low-ready carry on patrol, rifle in the shoulder in contact. Both sets
+     of angles were solved against the weapon's own grip and handguard, so the
+     gloves sit on the rifle instead of near it. A positive shoulder pitch swings
+     the arm forward — down -Z, the way the man is facing. */
+  p.arms[0].sh.rotation.x = lerp(0.85 + s1*0.25*walk, 1.50, cb);   // support
+  p.arms[0].sh.rotation.z = lerp(0.65, 0.62, cb);
+  p.arms[0].el.rotation.x = lerp(-0.11, -0.15, cb);
+  p.arms[1].sh.rotation.x = lerp(1.12 - s1*0.25*walk, 1.99, cb);   // trigger
+  p.arms[1].sh.rotation.z = lerp(-0.28, -0.68, cb);
+  p.arms[1].el.rotation.x = lerp(-1.39, -1.69, cb);
+  p.gun.position.set(lerp(0.14,0.10,cb), lerp(-0.30,-0.05,cb), lerp(-0.20,-0.26,cb));
+  p.gun.rotation.set(lerp(-0.42,0,cb), lerp(-0.16,0,cb), lerp(0.20,0,cb));
+  p.rig.rotation.x = lerp(0, e.aimPitch, cb);
+  p.head.rotation.x = lerp(0, e.aimPitch*0.5, cb);
 
-  /* flinch pushes the torso back */
-  p.model.position.z = -e.flinch*0.14;
-  p.model.rotation.x = -e.flinch*0.20;
+  /* Flinch rocks the torso back off the shot. -Z is the way he is facing, so
+     both of these have to be positive or a hit visibly walks him into it. */
+  p.model.position.z = e.flinch*0.14;
+  p.model.rotation.x = e.flinch*0.20;
 
   /* nameplate — suppressed on the menus, where it would read as debug overlay */
   const dCam = obj.position.distanceTo(camera.position);
@@ -6300,6 +6425,7 @@ function frame(now){
   /* always-running visual systems */
   dustField.time.value = now*0.001;
   dustField.camPos.value.copy(camera.position);
+  skyUniforms.uTime.value = now*0.001;
   updateSunShafts();
   updateViewmodel(dt, mdx, mdy);
   updateShells(dt);
