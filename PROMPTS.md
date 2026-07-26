@@ -1,28 +1,15 @@
 # Prompts
 
-Every instruction that produced this game, in the order it was given.
-
-The whole project ran from 11:15 PM on Friday 24 July 2026 to 11:47 AM on Sunday 26 July,
-roughly thirty-six hours across two overnight sessions. Twelve prompts. The model was
-Claude Opus 5 running as an agent in Cursor, with access to a browser over the DevTools
-protocol so it could load the game, drive it, read pixels back and test its own work.
-
-Wording below is unedited, typos included. Line breaks in two of the middle prompts were
-flattened in the session log and have been restored at the obvious boundaries; no words were
-changed.
+The prompts that specify the game, in the order they were given. Wording is unedited, typos
+included.
 
 ---
 
 ## 1. The specification
 
-Everything below arrived in one message. It is the only prompt that describes the game
-itself; every prompt after it is a correction, an addition or a question.
+Everything below arrived in one message.
 
 ```text
-here's the prompt. paste it into opus 5:
-
----
-
 build a complete realistic FPS shooter game in a single HTML file. everything inline — JS and CSS in the same file. no external dependencies except three.js from CDN (https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js). no build tools, no npm.
 
 **core gameplay:**
@@ -113,26 +100,13 @@ build a complete realistic FPS shooter game in a single HTML file. everything in
 - use instanced mesh for repeated objects like crates and barrels
 
 make it feel like a real game. weight to the movement, punch to the guns, tension in the combat. not a tech demo.
-
----
-
-create a folder in this disk first then cook and use skills from other folders three js and other three js skills /find-skills threejs
 ```
 
 ---
 
-## 2. A check-in
+## 2. Aim down sights, the sniper, and parkour
 
-```text
-just asking were you stuck in cdp runtime evaluate, if not \keep working
-```
-
----
-
-## 3. Aim down sights, the sniper, and parkour
-
-This is the prompt that added the fourth weapon, the scope, and the ability to climb
-onto things.
+Added the fourth weapon, the scope, and the ability to climb onto things.
 
 ```text
 aim-down-sights (ADS) for all weapons on right click:
@@ -161,29 +135,10 @@ add collision on top of all objects so player doesn't fall through
 
 ---
 
-## 4. The overnight brief
-
-No feature list. This one set the bar, and most of the atmosphere work, recoil tuning and
-environment detail came out of it.
-
-```text
-i'm going to sleep. when i wake up this needs to be perfect. this is going on twitter to 21,000+ followers. developers, engineers, US tech audience. they've seen every AI demo. they've seen every "i built a game with AI" post. if this looks like a tech demo or a toy, they'll scroll past it in half a second. the bar is a real game that happens to run in a browser. not a proof of concept. not "pretty good for AI." actually good. the shooting needs to feel punchy. the enemies need to feel dangerous. the map needs to feel like a real place, not floating boxes in a void. the ADS needs to feel smooth. the sniper scope needs to feel satisfying. if a random person opened this with no context, they should not immediately think "oh this was AI generated." they should think "wait this runs in a browser?" my reputation is on the line. don't let me down.
-```
-
----
-
-## 5. A power cut
-
-```text
-keep working my electricity was gone
-```
-
----
-
-## 6. The bug list
+## 3. The bug list
 
 The longest correction of the project. Collision, enemy AI and weapon reliability were all
-rebuilt off the back of this one.
+rebuilt off the back of it.
 
 ```text
 the game has major bugs that need fixing before this is shareable. go through everything and fix all of these:
@@ -220,9 +175,7 @@ test everything after fixing. walk along every wall. try to walk through every c
 
 ---
 
-## 7. The crosshair
-
-The last change to the game itself.
+## 4. The crosshair
 
 ```text
 replace the current crosshair with a valorant-style competitive crosshair:
@@ -255,56 +208,10 @@ draw this with canvas overlay, not HTML elements. needs to be pixel-perfect and 
 
 ---
 
-## 8. Where is it
+## 5. Enemy aim, the sky, and the M4 optic
+
+Sent with two screenshots: one looking up at the zenith, one down a container lane.
 
 ```text
-now where is the game located and where i can play now
+time to fix some bugs, enemeies guns are pointing backwards if you see while shooting and our sky looks pixelated like you can see here and one more thing zooming in in m4 carbine is like trash i mean theres' no use if i can't zoom in more and see enemy
 ```
-
----
-
-## 9. What did we build
-
-```text
-amazing, now tell me about our game
-```
-
----
-
-## 10. Stop the server
-
-```text
-bro stop the server now i need to go
-```
-
----
-
-## 11. Ship it
-
-```text
-https://github.com/StarKnightt push and host make a proffessional readme no emoji and make sure that it should be good man
-```
-
----
-
-## 12. This file
-
-```text
-now could you stitch all those prompts i have given to you and push there too
-```
-
----
-
-## What is not here
-
-There is no prompt covering the sky, the container stencils, the contact shadows under the
-clutter, the dust motes, the radio chatter, the recoil pattern, the combat director that caps
-how many enemies fire at once, the dynamic resolution scaling, or the test harness in
-[`tools/`](tools). Those came out of prompt 4, which asked for a real game and left the
-definition of one open.
-
-The bulk of the working time went not into writing the game but into verifying it: loading
-the page over the DevTools protocol, moving the player into every collider from four
-directions, firing every weapon at measured distances, reading the crosshair back pixel by
-pixel, and running a pathfinding bot through complete rounds to catch what manual testing
-would not.
