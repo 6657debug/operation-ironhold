@@ -1,6 +1,7 @@
 # local scratch
 _*.js
 _*.png
+_og/
 *.local.*
 
 # editor and OS
