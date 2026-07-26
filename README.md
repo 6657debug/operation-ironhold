@@ -14,6 +14,9 @@ synthesis, post-processing and HUD — is about 6,300 lines of JavaScript and CS
 into a single 290 KB `index.html`. The only external resource is three.js r128, pulled
 from a CDN. Everything else is generated at runtime.
 
+It was built by an AI agent across about thirty-six hours from twelve prompts. Every one of
+them is recorded verbatim in [PROMPTS.md](PROMPTS.md).
+
 ## Running it
 
 Open `index.html` in any desktop browser. That is the whole installation process.
@@ -186,6 +189,7 @@ pixels thick every edge has to land on a whole device pixel or it smears.
 
 ```
 index.html              the entire game
+PROMPTS.md              every prompt that produced it, verbatim
 screenshots/            images used by this README
 tools/test-harness.js   collision, weapon and AI test suite
 tools/autoplay-bot.js   pathfinding bot for unattended regression runs
