@@ -732,7 +732,10 @@ const SFX = (function(){
    ========================================================================= */
 const canvas   = document.getElementById('c');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias:false, powerPreference:'high-performance', stencil:false });
-const DPR = Math.min(window.devicePixelRatio||1, 1.5);
+/* High-DPI panels were rendering up to 2.25 source pixels per CSS pixel before
+   post-processing. 1.25 keeps the HUD and geometry crisp without making a
+   1440p/4K display pay almost the full cost of 4K/6K rendering. */
+const DPR = Math.min(window.devicePixelRatio||1, 1.25);
 renderer.setPixelRatio(DPR);
 renderer.setSize(innerWidth, innerHeight);
 renderer.autoClear = false;
@@ -789,10 +792,14 @@ const VM_LIGHT_BASE = {amb:0.40, key:1.52, fill:0.38, rim:0.42};
 
 /* ---- render targets ---- */
 const rtType = isGL2 ? THREE.HalfFloatType : THREE.UnsignedByteType;
+/* The post chain already softens hard edges. Four-sample MSAA on the full HDR
+   scene target multiplies its colour/depth bandwidth for very little visible
+   gain, so leave it off and keep the depth buffer required by the scene. */
+const USE_SCENE_MSAA = false;
 function makeRT(w,h,depth){
   const opts = { minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter,
                  format:THREE.RGBAFormat, type:rtType, depthBuffer:!!depth, stencilBuffer:false };
-  if (depth && isGL2 && THREE.WebGLMultisampleRenderTarget){
+  if (depth && USE_SCENE_MSAA && isGL2 && THREE.WebGLMultisampleRenderTarget){
     const rt = new THREE.WebGLMultisampleRenderTarget(w,h,opts);
     rt.samples = 4;
     return rt;
@@ -802,9 +809,9 @@ function makeRT(w,h,depth){
 let sceneRT, bloomA, bloomB, RTW, RTH;
 /* The whole frame lands in an offscreen target that the composite pass
    upscales, so render resolution can float independently of the canvas. */
-let renderScale = 1.0;
+let renderScale = 0.88;
 const SCALE_STEPS = [1.0, 0.88, 0.76, 0.64, 0.55];
-let scaleIdx = 0;
+let scaleIdx = 1;
 function allocTargets(){
   RTW = Math.max(2, Math.floor(innerWidth*DPR*renderScale));
   RTH = Math.max(2, Math.floor(innerHeight*DPR*renderScale));
@@ -1260,7 +1267,7 @@ scene.add(new THREE.HemisphereLight(0xa6bacd, 0x6f6450, 0.74));
 const sun = new THREE.DirectionalLight(0xffdcae, 2.35);
 sun.position.copy(SUN_DIR).multiplyScalar(92);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048,2048);
+sun.shadow.mapSize.set(1024,1024);
 sun.shadow.camera.near = 24;
 sun.shadow.camera.far  = 230;
 sun.shadow.camera.left = -52; sun.shadow.camera.right = 52;
@@ -4726,9 +4733,20 @@ function drawMinimap(){
 const keys = Object.create(null);
 let mouseDX=0, mouseDY=0;
 const SENS = 0.0022;
+/* A real mouse report is only a few dozen pixels even during a hard flick.
+   Chromium/Edge can occasionally emit a viewport-sized movement when its
+   hidden pointer is re-centred. Treat only that impossible report as a warp;
+   never queue, clamp or replay it on later frames. */
+const MAX_MOUSE_EVENT_DELTA = 240;
 let sensScale = 1;              // shrinks with ADS zoom so aim stays 1:1 on screen
 
+let rightGestureUntil = 0;
+let adsAfterLock = null;
+
 addEventListener('keydown', e=>{
+  /* Escape is the deliberate pause gesture. Do not let a preceding right
+     click make its pointer-lock release look like a secondary-button glitch. */
+  if (e.code==='Escape') rightGestureUntil = 0;
   if (e.repeat) { if(['Space','KeyR','Digit1','Digit2','Digit3','Digit4','KeyV'].includes(e.code)) e.preventDefault(); return; }
   keys[e.code]=true;
   if (e.code==='Space') player.spaceEdge = true;      // consumed by the jump/mantle step
@@ -4747,10 +4765,27 @@ addEventListener('keydown', e=>{
 addEventListener('keyup', e=>{ keys[e.code]=false; });
 addEventListener('mousemove', e=>{
   if (document.pointerLockElement !== document.body) return;
-  mouseDX += e.movementX || 0;
-  mouseDY += e.movementY || 0;
+  const dx=Number(e.movementX)||0, dy=Number(e.movementY)||0;
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+  if (Math.abs(dx)>MAX_MOUSE_EVENT_DELTA || Math.abs(dy)>MAX_MOUSE_EVENT_DELTA) return;
+  mouseDX+=dx; mouseDY+=dy;
 });
 addEventListener('mousedown', e=>{
+  if (e.button===2){
+    e.preventDefault();
+    rightGestureUntil = performance.now()+700;
+    if (!G.started || G.over) return;
+    if (UI.pause.classList.contains('on')) return; // overlay owns resume gestures
+    /* If a browser released pointer lock for its own right-click gesture, the
+       same button must recover mouse control and return to ADS, never pause. */
+    if (document.pointerLockElement !== document.body){
+      adsAfterLock = true;
+      SFX.init(); requestLock(false);
+      return;
+    }
+    if (G.running) toggleADS();
+    return;
+  }
   if (!G.running) return;
   /* Latch the press. A click and release inside one frame — which is most
      quick taps at 140fps — used to set triggerHeld and clear it again before
@@ -4758,48 +4793,98 @@ addEventListener('mousedown', e=>{
      buffer also lets a click land in the last moments of a reload or the
      cooldown between rounds, so the gun answers the instant it is able. */
   if (e.button===0){ player.triggerHeld=true; player.clickBuf=0.12; }
-  if (e.button===2){ e.preventDefault(); toggleADS(); }
-});
-addEventListener('mouseup', e=>{ if (e.button===0){ player.triggerHeld=false; player.triggerReleased=true; } });
+}, {capture:true});
+addEventListener('mouseup', e=>{
+  if (e.button===2) e.preventDefault();
+  if (e.button===0){ player.triggerHeld=false; player.triggerReleased=true; }
+}, {capture:true});
 addEventListener('wheel', e=>{
   if (!G.running) return;
   const n = WEAPONS.length;
   const dir = e.deltaY>0?1:-1;
   switchWeapon((player.weapon+dir+n)%n);
 }, {passive:true});
-addEventListener('contextmenu', e=>e.preventDefault());
+addEventListener('contextmenu', e=>{
+  e.preventDefault();
+  /* Some engines release pointer lock just before contextmenu. This event is
+     still a valid user gesture, so use it to restore the lock immediately. */
+  if (G.started && !G.over && document.pointerLockElement !== document.body &&
+      performance.now() <= rightGestureUntil){
+    adsAfterLock = true;
+    requestLock(false);
+  }
+}, {capture:true});
+addEventListener('auxclick', e=>{ if (e.button===2) e.preventDefault(); }, {capture:true});
+
+function showPause(){
+  G.paused = true; G.running=false;
+  player.ads=false; player.adsK=0; player.adsEase=0;
+  UI._scopeK=-1; UI.scope.style.opacity=0; compMat.uniforms.scope.value=0;
+  UI.cross.classList.remove('hidden'); vmRoot.visible=true;
+  UI.pause.classList.add('on');
+  SFX.suspend();
+}
 
 document.addEventListener('pointerlockchange', ()=>{
   const locked = document.pointerLockElement === document.body;
   if (!locked && G.started && !G.over){
-    G.paused = true; G.running=false;
-    player.ads=false; player.adsK=0; player.adsEase=0;
-    UI._scopeK=-1; UI.scope.style.opacity=0; compMat.uniforms.scope.value=0;
-    UI.cross.classList.remove('hidden'); vmRoot.visible=true;
-    UI.pause.classList.add('on');
-    SFX.suspend();
+    if (performance.now() <= rightGestureUntil){
+      /* Right click is ADS, not pause. Preserve the state selected by this
+         click and immediately repair an engine-induced lock release. */
+      if (adsAfterLock===null) adsAfterLock=player.ads;
+      G.paused=false; G.running=false;
+      UI.pause.classList.remove('on');
+      SFX.suspend();
+      requestLock(false);
+      return;
+    }
+    adsAfterLock=null;
+    showPause();
   } else if (locked){
+    clearTimeout(requestLock._t);
+    requestLock._pending=false;
+    /* Never apply a final movement packet left over from the unlocked cursor. */
+    mouseDX=mouseDY=0;
     G.paused = false;
     UI.pause.classList.remove('on');
-    if (G.started && !G.over){ G.running = true; SFX.resume(); }
+    if (G.started && !G.over){
+      G.running = true; SFX.resume();
+      if (adsAfterLock!==null) setADS(adsAfterLock);
+    }
+    adsAfterLock=null;
   }
 });
-function requestLock(){
-  const p = document.body.requestPointerLock();
-  if (p && p.catch) p.catch(()=>{});
+function requestLock(pauseOnFailure=true){
+  if (requestLock._pending || document.pointerLockElement===document.body) return;
+  requestLock._pending=true;
+  let p;
+  try { p = document.body.requestPointerLock(); }
+  catch (_) {
+    requestLock._pending=false;
+    if (pauseOnFailure && G.started && !G.over) showPause();
+    return;
+  }
+  if (p && p.catch) p.catch(()=>{
+    requestLock._pending=false;
+    if (pauseOnFailure && G.started && !G.over) showPause();
+  });
   /* a denied request fires no pointerlockchange, which would leave the round
      live but with no mouse look. fall back to the pause overlay so a second
      click can try again. */
   clearTimeout(requestLock._t);
   requestLock._t = setTimeout(()=>{
+    requestLock._pending=false;
     if (document.pointerLockElement === document.body) return;
     if (!G.started || G.over) return;
-    G.paused = true; G.running = false;
-    UI.pause.classList.add('on');
+    if (pauseOnFailure) showPause();
   }, 350);
 }
 UI.startScreen.addEventListener('click', ()=>{ SFX.init(); startGame(); });
-UI.pause.addEventListener('click', ()=>{ SFX.init(); requestLock(); });
+UI.pause.addEventListener('mousedown', e=>{
+  e.preventDefault();
+  adsAfterLock = e.button===2 ? true : null;
+  SFX.init(); requestLock();
+});
 $('restartBtn').addEventListener('click', e=>{ e.stopPropagation(); restart(); });
 
 /* =========================================================================
@@ -5774,7 +5859,9 @@ function updatePlayer(dt){
   player.pitch -= mouseDY*SENS*sensScale;
   player.pitch = clamp(player.pitch, -PI/2+0.02, PI/2-0.02);
   const swayInX = mouseDX, swayInY = mouseDY;
-  mouseDX = mouseDY = 0;
+  /* Mouse input is consumed exactly once. Nothing remains queued after the
+     physical mouse stops, so the camera can never coast or auto-rotate. */
+  mouseDX=mouseDY=0;
 
   /* recoil spring (partial auto-recovery) */
   player.recoilVelP = damp(player.recoilVelP, 0, 16, dt);
@@ -6293,6 +6380,7 @@ function resetWorldState(){
   player.ads=false; player.adsK=0; player.adsEase=0; player.swayAmp=1;
   player.breath=0; player.breathHeld=false; player.breathLock=false;
   player.mantleT=0; player.mantleTilt=0; player.jumpsLeft=1; player.spaceEdge=false;
+  mouseDX=mouseDY=0; rightGestureUntil=0; adsAfterLock=null;
   sensScale=1; fovCur=BASE_FOV; vmRoot.visible=true;
   vmCamera.position.z=0; vmCamera.fov=VM_FOV; vmCamera.updateProjectionMatrix();
   UI._scopeK=-1; UI.scope.style.opacity=0; compMat.uniforms.scope.value=0; UI.cross.classList.remove('hidden');
@@ -6417,7 +6505,7 @@ function frame(now){
   if (dt <= 0) return;
   adaptive(dt);
 
-  const mdx = mouseDX, mdy = mouseDY;
+  const mdx=mouseDX, mdy=mouseDY;
 
   if (G.running && !G.over){
     G.elapsed += dt;
@@ -6428,7 +6516,7 @@ function frame(now){
     for (const e of enemies) updateEnemy(e, dt);
     if (G.time<=0){ G.time=0; endGame(false); }
   } else {
-    mouseDX = mouseDY = 0;
+    mouseDX=mouseDY=0;
     /* menu camera: a slow crane through the yard rather than a map overview,
        so the containers pass close enough to give real parallax */
     if (!G.started && !G.over){
@@ -6507,10 +6595,6 @@ function frame(now){
   blurMat.uniforms.dir.value.set(bw*1.0, 0); blit(blurMat, bloomB);
   blurMat.uniforms.tDiffuse.value = bloomB.texture;
   blurMat.uniforms.dir.value.set(0, bh*1.0); blit(blurMat, bloomA);
-  blurMat.uniforms.tDiffuse.value = bloomA.texture;
-  blurMat.uniforms.dir.value.set(bw*2.6, 0); blit(blurMat, bloomB);
-  blurMat.uniforms.tDiffuse.value = bloomB.texture;
-  blurMat.uniforms.dir.value.set(0, bh*2.6); blit(blurMat, bloomA);
 
   compMat.uniforms.tScene.value = sceneRT.texture;
   compMat.uniforms.tBloom.value = bloomA.texture;
